@@ -1,0 +1,30 @@
+# --- Secrets ---
+.env
+*.env
+
+# --- Model files (too large for git, ~14-55MB) ---
+*.onnx
+*.gguf
+crypto_student_model/
+
+# --- Generated data (re-created by running the pipeline) ---
+raw_data.json
+labeled_data.json
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Node / React UI ---
+crypto-ui/node_modules/
+crypto-ui/dist/
+
+# --- OS ---
+.DS_Store
+Thumbs.db
