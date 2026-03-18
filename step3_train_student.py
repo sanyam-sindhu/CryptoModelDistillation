@@ -19,9 +19,11 @@ from transformers import (
     AutoModelForSequenceClassification,
     get_linear_schedule_with_warmup,
 )
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
+from sklearn.model_selection import train_test_split, StratifiedShuffleSplit
+from sklearn.metrics import classification_report, f1_score
 from pathlib import Path
+import mlflow
+import mlflow.pytorch
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 INPUT_FILE     = "labeled_data.json"
@@ -29,12 +31,12 @@ MODEL_OUT_DIR  = "crypto_student_model"
 BASE_MODEL     = "huawei-noah/TinyBERT_General_4L_312D"  # ~56MB
 LABEL_MAP      = {"BUY": 0, "SELL": 1, "HOLD": 2}
 ID2LABEL       = {0: "BUY", 1: "SELL", 2: "HOLD"}
-EPOCHS         = 5
+EPOCHS         = 10
 BATCH_SIZE     = 32
-LR             = 2e-5
+LR             = 3e-5
 MAX_LEN        = 128
 DISTILL_TEMP   = 4.0    # temperature for soft labels
-DISTILL_ALPHA  = 0.7    # weight for soft loss vs hard loss
+DISTILL_ALPHA  = 0.3    # lower = more weight on hard weighted CE loss
 # ──────────────────────────────────────────────────────────────────────────────
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -90,17 +92,14 @@ class CryptoDataset(Dataset):
 
 # ─── DISTILLATION LOSS ────────────────────────────────────────────────────────
 
-def distillation_loss(student_logits, true_labels, temperature=DISTILL_TEMP, alpha=DISTILL_ALPHA):
+def distillation_loss(student_logits, true_labels, class_weights, temperature=DISTILL_TEMP, alpha=DISTILL_ALPHA):
     """
     Combined loss:
       alpha     * KL soft loss  (student mimics its own soft distribution at high temp)
-      (1-alpha) * cross-entropy (student learns true labels)
-
-    Note: Without a live teacher in this loop, we use label smoothing as a proxy
-    for soft targets. For full teacher distillation, run teacher inference here.
+      (1-alpha) * cross-entropy (student learns true labels, weighted for class imbalance)
     """
-    # Hard loss: learn from ground-truth labels
-    hard_loss = F.cross_entropy(student_logits, true_labels)
+    # Hard loss: weighted cross-entropy to penalise minority class mistakes more
+    hard_loss = F.cross_entropy(student_logits, true_labels, weight=class_weights)
 
     # Soft loss: label smoothing proxy (simulates teacher uncertainty)
     num_classes = student_logits.size(-1)
@@ -146,14 +145,26 @@ def train():
     data = [s for s in data if s.get("label") in LABEL_MAP]
     print(f"\nLoaded {len(data)} labeled samples")
 
-    # Train/val split
-    train_data, val_data = train_test_split(data, test_size=0.15, random_state=42)
+    # Stratified train/val split — keeps BUY/SELL/HOLD ratio in both sets
+    from collections import Counter
+    all_labels_str = [s["label"] for s in data]
+    sss = StratifiedShuffleSplit(n_splits=1, test_size=0.15, random_state=42)
+    train_idx, val_idx = next(sss.split(data, all_labels_str))
+    train_data = [data[i] for i in train_idx]
+    val_data   = [data[i] for i in val_idx]
     print(f"Train: {len(train_data)}  Val: {len(val_data)}")
 
-    # Print label distribution
-    from collections import Counter
     dist = Counter(s["label"] for s in train_data)
     print(f"Label distribution: {dict(dist)}")
+
+    # Class weights: penalise minority class (BUY/SELL) mistakes more
+    total = len(train_data)
+    class_weights = torch.tensor([
+        total / (3 * dist["BUY"]),
+        total / (3 * dist["SELL"]),
+        total / (3 * dist["HOLD"]),
+    ], dtype=torch.float).to(device)
+    print(f"Class weights: BUY={class_weights[0]:.2f} SELL={class_weights[1]:.2f} HOLD={class_weights[2]:.2f}")
 
     # Load tokenizer + model
     print(f"\nLoading base model: {BASE_MODEL}")
@@ -187,50 +198,81 @@ def train():
     best_val_acc = 0.0
     print(f"\nStarting training for {EPOCHS} epochs...\n")
 
-    for epoch in range(1, EPOCHS + 1):
-        model.train()
-        total_loss = 0.0
+    mlflow.set_experiment("crypto-distillation")
+    with mlflow.start_run():
+        # Log all hyperparameters
+        mlflow.log_params({
+            "base_model":    BASE_MODEL,
+            "epochs":        EPOCHS,
+            "batch_size":    BATCH_SIZE,
+            "learning_rate": LR,
+            "max_len":       MAX_LEN,
+            "distill_temp":  DISTILL_TEMP,
+            "distill_alpha": DISTILL_ALPHA,
+            "train_size":    len(train_data),
+            "val_size":      len(val_data),
+            "weight_BUY":    round(class_weights[0].item(), 3),
+            "weight_SELL":   round(class_weights[1].item(), 3),
+            "weight_HOLD":   round(class_weights[2].item(), 3),
+        })
 
-        for step, batch in enumerate(train_dl):
-            ids    = batch["input_ids"].to(device)
-            mask   = batch["attention_mask"].to(device)
-            labels = batch["label"].to(device)
+        for epoch in range(1, EPOCHS + 1):
+            model.train()
+            total_loss = 0.0
 
-            logits = model(ids, attention_mask=mask).logits
-            loss   = distillation_loss(logits, labels)
+            for step, batch in enumerate(train_dl):
+                ids    = batch["input_ids"].to(device)
+                mask   = batch["attention_mask"].to(device)
+                labels = batch["label"].to(device)
 
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            scheduler.step()
+                logits = model(ids, attention_mask=mask).logits
+                loss   = distillation_loss(logits, labels, class_weights)
 
-            total_loss += loss.item()
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step()
 
-            if (step + 1) % 20 == 0:
-                print(f"  Epoch {epoch} Step {step+1}/{len(train_dl)} "
-                      f"Loss: {total_loss/(step+1):.4f}")
+                total_loss += loss.item()
 
-        # Validation
-        val_acc, preds, labels_list = evaluate(model, val_dl)
-        avg_loss = total_loss / len(train_dl)
+                if (step + 1) % 20 == 0:
+                    print(f"  Epoch {epoch} Step {step+1}/{len(train_dl)} "
+                          f"Loss: {total_loss/(step+1):.4f}")
 
-        print(f"\nEpoch {epoch}/{EPOCHS} — Loss: {avg_loss:.4f}  Val Acc: {val_acc:.4f}")
-        print(classification_report(
-            labels_list, preds,
-            target_names=["BUY", "SELL", "HOLD"],
-            zero_division=0,
-        ))
+            # Validation
+            val_acc, preds, labels_list = evaluate(model, val_dl)
+            avg_loss = total_loss / len(train_dl)
+            f1 = f1_score(labels_list, preds, average="weighted", zero_division=0)
 
-        # Save best model
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            model.save_pretrained(MODEL_OUT_DIR)
-            tokenizer.save_pretrained(MODEL_OUT_DIR)
-            print(f"  ★ New best model saved to {MODEL_OUT_DIR}/\n")
+            # Log per-epoch metrics
+            mlflow.log_metrics({
+                "train_loss": avg_loss,
+                "val_accuracy": val_acc,
+                "val_f1": f1,
+            }, step=epoch)
 
-    print(f"\n✓ Training complete! Best val accuracy: {best_val_acc:.4f}")
+            print(f"\nEpoch {epoch}/{EPOCHS} — Loss: {avg_loss:.4f}  Val Acc: {val_acc:.4f}  F1: {f1:.4f}")
+            print(classification_report(
+                labels_list, preds,
+                target_names=["BUY", "SELL", "HOLD"],
+                zero_division=0,
+            ))
+
+            # Save best model
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                model.save_pretrained(MODEL_OUT_DIR)
+                tokenizer.save_pretrained(MODEL_OUT_DIR)
+                mlflow.log_metric("best_val_accuracy", best_val_acc, step=epoch)
+                mlflow.log_artifacts(MODEL_OUT_DIR, artifact_path="best_model")
+                print(f"  ** New best model saved to {MODEL_OUT_DIR}/\n")
+
+        mlflow.log_metric("final_best_val_accuracy", best_val_acc)
+
+    print(f"\nDone! Best val accuracy: {best_val_acc:.4f}")
     print(f"  Model saved to: {MODEL_OUT_DIR}/")
+    print("  Run `mlflow ui` to view experiment dashboard")
     print("  Next: run step4_export_model.py")
 
 

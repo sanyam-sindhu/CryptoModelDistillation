@@ -8,11 +8,16 @@ feedparser>=6.0.11
 # ── Teacher Labeling (Step 2) ─────────────────────────────────────────────────
 anthropic>=0.40.0
 
-# ── Training (Step 3) — install on Google Colab ───────────────────────────────
-torch>=2.1.0
+# ── Training (Step 3) — ──────────────────────────────
+# CPU only (default, works everywhere):
+#   pip install torch
+# GPU (NVIDIA, recommended):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+# The training script auto-detects GPU vs CPU
 transformers>=4.40.0
 datasets>=2.18.0
 scikit-learn>=1.4.0
+mlflow>=2.13.0
 
 # ── Export + Quantize (Step 4) ────────────────────────────────────────────────
 onnx>=1.16.0

@@ -60,9 +60,11 @@ Sends each sample to Claude with a structured prompt. Claude returns BUY, SELL, 
 ```bash
 python step3_train_student.py
 ```
-Fine-tunes TinyBERT (~14M params) on the labeled data using a distillation loss — part cross-entropy on the hard labels, part KL divergence on soft targets. Runs on CPU but a GPU or Colab speeds it up significantly. Outputs `crypto_student_model/`.
+Fine-tunes TinyBERT (~14M params) on the labeled data using a distillation loss — part weighted cross-entropy on the hard labels, part KL divergence on soft targets. Class weights automatically balance BUY/SELL/HOLD during training. Tracks every run with MLflow. Outputs `crypto_student_model/`.
 
 > For Colab: upload `labeled_data.json`, open `step3_train_student.ipynb`, run all cells, download `crypto_student_model/`.
+
+> To view training metrics: run `mlflow ui` then open http://localhost:5000
 
 **Step 4 — Export to ONNX**
 ```bash

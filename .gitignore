@@ -25,6 +25,10 @@ venv/
 crypto-ui/node_modules/
 crypto-ui/dist/
 
+# --- MLflow ---
+mlruns/
+mlartifacts/
+
 # --- OS ---
 .DS_Store
 Thumbs.db
